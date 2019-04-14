@@ -4,6 +4,8 @@
 package actorbintree
 
 import akka.actor._
+import akka.event.LoggingReceive
+
 import scala.collection.immutable.Queue
 
 object BinaryTreeSet {
@@ -43,7 +45,7 @@ object BinaryTreeSet {
     * `result` is true if and only if the element is present in the tree.
     */
   case class ContainsResult(id: Int, result: Boolean) extends OperationReply
-  
+
   /** Message to signal successful completion of an insert or remove operation. */
   case class OperationFinished(id: Int) extends OperationReply
 
@@ -66,9 +68,13 @@ class BinaryTreeSet extends Actor {
 
   // optional
   /** Accepts `Operation` and `GC` messages. */
-  val normal: Receive = {
+  val normal: Receive = LoggingReceive {
     case op: Operation => root forward op
-    case GC => ???
+    case GC =>
+      val newRoot = createRoot
+      pendingQueue = Queue.empty[Operation]
+      context become garbageCollecting(newRoot)
+      root ! CopyTo(newRoot)
   }
 
   // optional
@@ -76,7 +82,15 @@ class BinaryTreeSet extends Actor {
     * `newRoot` is the root of the new binary tree where we want to copy
     * all non-removed elements into.
     */
-  def garbageCollecting(newRoot: ActorRef): Receive = ???
+  def garbageCollecting(newRoot: ActorRef): Receive = LoggingReceive {
+    case op: Operation =>
+      pendingQueue = pendingQueue.enqueue(op)
+    case CopyFinished =>
+      pendingQueue.foreach(newRoot ! _)
+      root = newRoot
+      context unbecome()
+    case GC => // ignore
+  }
 
 }
 
@@ -104,7 +118,7 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
 
   // optional
   /** Handles `Operation` messages and `CopyTo` requests. */
-  val normal: Receive = {
+  val normal: Receive = LoggingReceive {
     case Insert(requester, id, e) =>
       if (e == elem && !removed) {
         removed = false
@@ -146,13 +160,41 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
             requester ! OperationFinished(id)
         }
       }
+
+    case CopyTo(treeNode) =>
+      val nodes = subtrees.values.toSet
+      if (removed && nodes.isEmpty) {
+        context.parent ! CopyFinished
+        self ! PoisonPill
+      } else {
+        context become copying(nodes, removed)
+        if (!removed) treeNode ! Insert(self, -1, elem)
+        nodes.foreach(_ ! CopyTo(treeNode))
+      }
   }
 
   // optional
   /** `expected` is the set of ActorRefs whose replies we are waiting for,
     * `insertConfirmed` tracks whether the copy of this node to the new tree has been confirmed.
     */
-  def copying(expected: Set[ActorRef], insertConfirmed: Boolean): Receive = ???
+  def copying(expected: Set[ActorRef], insertConfirmed: Boolean): Receive = {
+    case OperationFinished(_) =>
+      if (expected.isEmpty) {
+        context.parent ! CopyFinished
+        self ! PoisonPill
+      } else {
+        context become copying(expected, insertConfirmed = true)
+      }
+
+    case CopyFinished =>
+      val newExpected = expected - sender
+      if (newExpected.isEmpty && insertConfirmed) {
+        context.parent ! CopyFinished
+        self ! PoisonPill
+      } else {
+        context become copying(newExpected, insertConfirmed)
+      }
+  }
 
   private def resolvePosition(e: Int): Position = if (e > elem) Right else Left
 }
