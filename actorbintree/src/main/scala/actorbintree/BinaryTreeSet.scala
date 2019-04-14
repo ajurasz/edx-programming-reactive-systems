@@ -111,12 +111,12 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
         requester ! OperationFinished(id)
       } else {
         val nextPos = resolvePosition(e)
-        if (subtrees.isDefinedAt(nextPos)) {
-          val r = requester
-          subtrees(nextPos) ! Insert(r, id, e)
-        } else {
-          subtrees += (nextPos -> context.actorOf(props(e, initiallyRemoved = false)))
-          requester ! OperationFinished(id)
+        subtrees.get(nextPos) match {
+          case Some(ref) =>
+            ref ! Insert(requester, id, e)
+          case None =>
+            subtrees += (nextPos -> context.actorOf(props(e, initiallyRemoved = false)))
+            requester ! OperationFinished(id)
         }
       }
 
@@ -125,11 +125,11 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
         requester ! ContainsResult(id, result = true)
       } else {
         val nextPos = resolvePosition(e)
-        if (subtrees.isDefinedAt(nextPos)) {
-          val r = requester
-          subtrees(nextPos) ! Contains(requester, id, e)
-        } else {
-          requester ! ContainsResult(id, result = false)
+        subtrees.get(nextPos) match {
+          case Some(ref) =>
+            ref ! Contains(requester, id, e)
+          case None =>
+            requester ! ContainsResult(id, result = false)
         }
       }
   }
