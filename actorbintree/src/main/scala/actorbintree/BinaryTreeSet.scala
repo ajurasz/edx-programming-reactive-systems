@@ -106,7 +106,7 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
   /** Handles `Operation` messages and `CopyTo` requests. */
   val normal: Receive = {
     case Insert(requester, id, e) =>
-      if (e == elem && !initiallyRemoved) {
+      if (e == elem && !removed) {
         removed = false
         requester ! OperationFinished(id)
       } else {
@@ -121,7 +121,7 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
       }
 
     case Contains(requester, id, e) =>
-      if (e == elem && !initiallyRemoved) {
+      if (e == elem && !removed) {
         requester ! ContainsResult(id, result = true)
       } else {
         val nextPos = resolvePosition(e)
@@ -130,6 +130,20 @@ class BinaryTreeNode(val elem: Int, initiallyRemoved: Boolean) extends Actor {
             ref ! Contains(requester, id, e)
           case None =>
             requester ! ContainsResult(id, result = false)
+        }
+      }
+
+    case Remove(requester, id, e) =>
+      if (e == elem && !removed) {
+        removed = true
+        requester ! OperationFinished(id)
+      } else {
+        val nextPos = resolvePosition(e)
+        subtrees.get(nextPos) match {
+          case Some(ref) =>
+            ref ! Remove(requester, id, e)
+          case None =>
+            requester ! OperationFinished(id)
         }
       }
   }
