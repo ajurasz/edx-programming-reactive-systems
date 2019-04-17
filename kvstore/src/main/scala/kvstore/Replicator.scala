@@ -4,6 +4,7 @@ import akka.actor.Props
 import akka.actor.Actor
 import akka.actor.ActorRef
 import scala.concurrent.duration._
+import scala.language.postfixOps
 
 object Replicator {
   case class Replicate(key: String, valueOption: Option[String], id: Long)
@@ -11,6 +12,8 @@ object Replicator {
 
   case class Snapshot(key: String, valueOption: Option[String], seq: Long)
   case class SnapshotAck(key: String, seq: Long)
+
+  case class Retry(key: String, valueOption: Option[String], seq: Long)
 
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
@@ -42,6 +45,14 @@ class Replicator(val replica: ActorRef) extends Actor {
       val seq = nextSeq()
       replica ! Snapshot(key, valueOption, seq)
       acks += ((seq, (sender, Replicate(key, valueOption, id))))
+      context.system.scheduler.scheduleOnce(100 milliseconds) {
+        self ! Retry(key, valueOption, seq)
+      }
+    case Retry(key, valueOption, seq) if acks.get(seq).nonEmpty =>
+      replica ! Snapshot(key, valueOption, seq)
+      context.system.scheduler.scheduleOnce(100 milliseconds) {
+        self ! Retry(key, valueOption, seq)
+      }
     case SnapshotAck(_, seq) if acks.get(seq).nonEmpty =>
       for ((primary, Replicate(key, _, id)) <- acks.get(seq)) {
         acks -= seq
