@@ -56,10 +56,17 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
+  // the map of persistence seq to teplicator
+  var persistenceSeqToReplicator = Map.empty[Long, ActorRef]
 
   var currentSeqNo = 0L
 
-  override def preStart(): Unit = arbiter ! Join
+  var persistence: ActorRef = _
+
+  override def preStart(): Unit = {
+    arbiter ! Join
+    persistence = context.actorOf(persistenceProps)
+  }
 
   override def postStop(): Unit = {
     secondaries.get(self).foreach(replicator => {
@@ -105,11 +112,16 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case Snapshot(key, value, seq) if seq == currentSeqNo =>
-      updateKV(key, value, SnapshotAck(key, seq))
-      incSeq()
+      persistence ! Persist(key, value, seq)
+      persistenceSeqToReplicator += (seq -> sender)
+      updateKV(key, value)
     case Snapshot(key, value, seq) if seq > currentSeqNo => // ignore
     case Snapshot(key, value, seq) if seq < currentSeqNo =>
       sender() ! SnapshotAck(key, seq)
+    case Persisted(key, id) =>
+      persistenceSeqToReplicator.get(id).foreach(_ ! SnapshotAck(key, id))
+      persistenceSeqToReplicator -= id
+      incSeq()
     case _ =>
   }
 
@@ -120,14 +132,12 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     }
   }
 
-  private def updateKV(key: String, value: Option[String], message: Any): Unit = {
+  private def updateKV(key: String, value: Option[String]): Unit = {
     value match {
       case Some(v) =>
         kv += (key -> v)
-        sender() ! message
       case None =>
         kv -= key
-        sender() ! message
     }
   }
 
