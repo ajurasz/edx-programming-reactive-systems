@@ -1,17 +1,22 @@
 package kvstore
 
-import akka.actor.{OneForOneStrategy, Props, ActorRef, Actor}
+import akka.actor.{Actor, ActorRef, OneForOneStrategy, Props}
 import kvstore.Arbiter._
+
 import scala.collection.immutable.Queue
 import akka.actor.SupervisorStrategy.Restart
+
 import scala.annotation.tailrec
 import akka.pattern.{ask, pipe}
 import akka.actor.Terminated
+
 import scala.concurrent.duration._
 import akka.actor.PoisonPill
 import akka.actor.OneForOneStrategy
 import akka.actor.SupervisorStrategy
 import akka.util.Timeout
+
+import scala.language.postfixOps
 
 object Replica {
 
@@ -36,6 +41,8 @@ object Replica {
   case class OperationFailed(id: Long) extends OperationReply
 
   case class GetResult(key: String, valueOption: Option[String], id: Long) extends OperationReply
+
+  case class RetryPersist(key: String, valueOption: Option[String], id: Long)
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
@@ -115,10 +122,18 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       persistence ! Persist(key, value, seq)
       persistenceSeqToReplicator += (seq -> sender)
       updateKV(key, value)
+      context.system.scheduler.scheduleOnce(100 milliseconds) {
+        self ! RetryPersist(key, value, seq)
+      }
     case Snapshot(key, value, seq) if seq > currentSeqNo => // ignore
     case Snapshot(key, value, seq) if seq < currentSeqNo =>
       sender() ! SnapshotAck(key, seq)
-    case Persisted(key, id) =>
+    case RetryPersist(key, valueOption, seq) if persistenceSeqToReplicator.get(seq).nonEmpty =>
+      persistence ! Persist(key, valueOption, seq)
+      context.system.scheduler.scheduleOnce(100 milliseconds) {
+        self ! RetryPersist(key, valueOption, seq)
+      }
+    case Persisted(key, id) if persistenceSeqToReplicator.get(id).nonEmpty  =>
       persistenceSeqToReplicator.get(id).foreach(_ ! SnapshotAck(key, id))
       persistenceSeqToReplicator -= id
       incSeq()
