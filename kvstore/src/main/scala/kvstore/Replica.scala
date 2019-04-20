@@ -72,21 +72,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   var currentSeqNo = 0L
 
+  var shutdownInitiated= false
+
   var persistence: ActorRef = _
 
   override def preStart(): Unit = {
     arbiter ! Join
     persistence = context.actorOf(persistenceProps)
   }
-
-  override def postStop(): Unit = {
-    secondaries.get(self).foreach(replicator => {
-      replicator ! PoisonPill
-      secondaries -= self
-      replicators -= replicator
-    })
-  }
-
 
   override def supervisorStrategy: SupervisorStrategy = OneForOneStrategy() {
     case _ => Restart
@@ -101,29 +94,22 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   val leader: Receive = {
     case message @ Insert(key, value, id) =>
       kv += (key -> value)
-      forwardToReplicators(message)
+      replicate(replicators, message)
       val client = sender()
       acksGlogalTimeout(id, client)
       persist(key, Some(value), id)
     case message @ Remove(key, id) =>
       kv -= key
-      forwardToReplicators(message)
+      replicate(replicators, message)
       val client = sender()
       acksGlogalTimeout(id, client)
       persist(key, None, id)
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case Replicas(replicas) =>
-      replicas
-        .filter(_ != self)
-        .filter(!secondaries.contains(_))
-        .foreach(replica => {
-          val replicatorRef = context.actorOf(Replicator.props(replica))
-          replicators += replicatorRef
-          secondaries += (replica -> replicatorRef)
-        })
+      handleRemovedReplicas(replicas)
+      handleNewReplicas(replicas)
     case Replicated(key, id) =>
-      println("Replicated")
       for (count <- replicationAcks.get(id)) {
         if (count <= 1) {
           replicationAcks -= id
@@ -162,12 +148,47 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case _ =>
   }
 
-  private def forwardToReplicators(message: UpdateOperation): Unit = {
+  private def handleRemovedReplicas(replicas: Set[ActorRef]): Unit = {
+    secondaries
+      .filterKeys(!replicas.contains(_))
+      .keySet
+      .foreach(replica => {
+        replica ! PoisonPill
+        secondaries.get(replica).foreach(replicator => {
+          replicator ! PoisonPill
+          replicators -= replicator
+        })
+        secondaries -= replica
+      })
+  }
+
+  private def handleNewReplicas(replicas: Set[ActorRef]): Unit = {
+    replicas
+      .filter(_ != self)
+      .filter(!secondaries.contains(_))
+      .foreach(replica => {
+        val replicatorRef = context.actorOf(Replicator.props(replica))
+        replicateStore(replicatorRef)
+        replicators += replicatorRef
+        secondaries += (replica -> replicatorRef)
+      })
+  }
+
+  private def replicate(replicators: Set[ActorRef], message: UpdateOperation): Unit = {
     message match {
       case Insert(key, value, id) => replicators.foreach(_ ! Replicate(key, Some(value), id))
       case Remove(key, id) => replicators.foreach(_ ! Replicate(key, None, id))
     }
     replicationAcks += (message.id -> replicators.size)
+  }
+
+  private def replicateStore(replica: ActorRef): Unit = {
+    var id = 0
+    kv.foreach {
+      case (key, value) =>
+        replica ! Replicate(key, Some(value), id)
+        id += 1
+    }
   }
 
   private def persist(key: String, valueOption: Option[String], id: Long): Unit = {
