@@ -44,6 +44,8 @@ object Replica {
 
   case class RetryPersist(key: String, valueOption: Option[String], id: Long)
 
+  case class CheckPersist(id: Long, client: ActorRef)
+
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
 
@@ -63,8 +65,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
-  // the map of persistence seq to teplicator
-  var persistenceSeqToReplicator = Map.empty[Long, ActorRef]
+  // the map of persistence seq to replicator
+  var persistenceAcks = Map.empty[Long, ActorRef]
+  // the map of replication seq to replicator
+//  var persistenceAcks = Map.empty[Long, ActorRef]
 
   var currentSeqNo = 0L
 
@@ -83,6 +87,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     })
   }
 
+
+  override def supervisorStrategy: SupervisorStrategy = OneForOneStrategy() {
+    case _ => Restart
+  }
+
   def receive = {
     case JoinedPrimary => context.become(leader)
     case JoinedSecondary => context.become(replica)
@@ -92,12 +101,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   val leader: Receive = {
     case message @ Insert(key, value, id) =>
       kv += (key -> value)
-      sender() ! OperationAck(id)
       forwardToReplicators(message)
+      val client = sender()
+      persist(key, Some(value), id, Some(client))
     case message @ Remove(key, id) =>
       kv -= key
-      sender() ! OperationAck(id)
       forwardToReplicators(message)
+      val client = sender()
+      persist(key, None, id, Some(client))
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case Replicas(replicas) =>
@@ -111,6 +122,15 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         })
     case Replicated(key, id) =>
       println("Replicated")
+    case RetryPersist(key, valueOption, seq) if persistenceAcks.get(seq).nonEmpty =>
+      retryPersist(key, valueOption, seq)
+    case Persisted(key, id) if persistenceAcks.get(id).nonEmpty  =>
+      persistenceAcks.get(id).foreach(_ ! OperationAck(id))
+      persistenceAcks -= id
+    case CheckPersist(id, client) =>
+      if (persistenceAcks.isDefinedAt(id)) {
+        client ! OperationFailed(id)
+      }
     case _ =>
   }
 
@@ -119,23 +139,16 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case Snapshot(key, value, seq) if seq == currentSeqNo =>
-      persistence ! Persist(key, value, seq)
-      persistenceSeqToReplicator += (seq -> sender)
       updateKV(key, value)
-      context.system.scheduler.scheduleOnce(100 milliseconds) {
-        self ! RetryPersist(key, value, seq)
-      }
+      persist(key, value, seq, None)
     case Snapshot(key, value, seq) if seq > currentSeqNo => // ignore
     case Snapshot(key, value, seq) if seq < currentSeqNo =>
       sender() ! SnapshotAck(key, seq)
-    case RetryPersist(key, valueOption, seq) if persistenceSeqToReplicator.get(seq).nonEmpty =>
-      persistence ! Persist(key, valueOption, seq)
-      context.system.scheduler.scheduleOnce(100 milliseconds) {
-        self ! RetryPersist(key, valueOption, seq)
-      }
-    case Persisted(key, id) if persistenceSeqToReplicator.get(id).nonEmpty  =>
-      persistenceSeqToReplicator.get(id).foreach(_ ! SnapshotAck(key, id))
-      persistenceSeqToReplicator -= id
+    case RetryPersist(key, valueOption, seq) if persistenceAcks.get(seq).nonEmpty =>
+      retryPersist(key, valueOption, seq)
+    case Persisted(key, id) if persistenceAcks.get(id).nonEmpty  =>
+      persistenceAcks.get(id).foreach(_ ! SnapshotAck(key, id))
+      persistenceAcks -= id
       incSeq()
     case _ =>
   }
@@ -144,6 +157,26 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     message match {
       case Insert(key, value, id) => replicators.foreach(_ ! Replicate(key, Some(value), id))
       case Remove(key, id) => replicators.foreach(_ ! Replicate(key, None, id))
+    }
+  }
+
+  private def persist(key: String, valueOption: Option[String], id: Long, persistenceClient: Option[ActorRef]): Unit = {
+    persistence ! Persist(key, valueOption, id)
+    persistenceAcks += (id -> sender)
+    context.system.scheduler.scheduleOnce(100 milliseconds) {
+      self ! RetryPersist(key, valueOption, id)
+    }
+    persistenceClient.foreach(client => {
+      context.system.scheduler.scheduleOnce(1 seconds) {
+        self ! CheckPersist(id, client)
+      }
+    })
+  }
+
+  private def retryPersist(key: String, valueOption: Option[String], id: Long): Unit = {
+    persistence ! Persist(key, valueOption, id)
+    context.system.scheduler.scheduleOnce(100 milliseconds) {
+      self ! RetryPersist(key, valueOption, id)
     }
   }
 
