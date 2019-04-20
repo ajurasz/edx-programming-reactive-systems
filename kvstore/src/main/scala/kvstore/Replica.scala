@@ -67,8 +67,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var replicators = Set.empty[ActorRef]
   // the map of persistence seq to replicator
   var persistenceAcks = Map.empty[Long, ActorRef]
-  // the map of replication seq to replicator
-//  var persistenceAcks = Map.empty[Long, ActorRef]
+  // the map of operation id to acks count
+  var replicationAcks = Map.empty[Long, Long]
 
   var currentSeqNo = 0L
 
@@ -103,12 +103,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       kv += (key -> value)
       forwardToReplicators(message)
       val client = sender()
-      persist(key, Some(value), id, Some(client))
+      acksGlogalTimeout(id, client)
+      persist(key, Some(value), id)
     case message @ Remove(key, id) =>
       kv -= key
       forwardToReplicators(message)
       val client = sender()
-      persist(key, None, id, Some(client))
+      acksGlogalTimeout(id, client)
+      persist(key, None, id)
     case Get(key, id) =>
       sender() ! GetResult(key, kv.get(key), id)
     case Replicas(replicas) =>
@@ -122,13 +124,20 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         })
     case Replicated(key, id) =>
       println("Replicated")
+      for (count <- replicationAcks.get(id)) {
+        if (count <= 1) {
+          replicationAcks -= id
+        } else {
+          replicationAcks = replicationAcks.updated(id, replicationAcks(id) - 1)
+        }
+      }
     case RetryPersist(key, valueOption, seq) if persistenceAcks.get(seq).nonEmpty =>
       retryPersist(key, valueOption, seq)
-    case Persisted(key, id) if persistenceAcks.get(id).nonEmpty  =>
+    case Persisted(_, id) if replicationAcks.withDefaultValue(0)(id) == 0 =>
       persistenceAcks.get(id).foreach(_ ! OperationAck(id))
       persistenceAcks -= id
     case CheckPersist(id, client) =>
-      if (persistenceAcks.isDefinedAt(id)) {
+      if (persistenceAcks.get(id).nonEmpty || replicationAcks.get(id).nonEmpty) {
         client ! OperationFailed(id)
       }
     case _ =>
@@ -140,7 +149,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       sender() ! GetResult(key, kv.get(key), id)
     case Snapshot(key, value, seq) if seq == currentSeqNo =>
       updateKV(key, value)
-      persist(key, value, seq, None)
+      persist(key, value, seq)
     case Snapshot(key, value, seq) if seq > currentSeqNo => // ignore
     case Snapshot(key, value, seq) if seq < currentSeqNo =>
       sender() ! SnapshotAck(key, seq)
@@ -153,30 +162,32 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case _ =>
   }
 
-  private def forwardToReplicators(message: Any): Unit = {
+  private def forwardToReplicators(message: UpdateOperation): Unit = {
     message match {
       case Insert(key, value, id) => replicators.foreach(_ ! Replicate(key, Some(value), id))
       case Remove(key, id) => replicators.foreach(_ ! Replicate(key, None, id))
     }
+    replicationAcks += (message.id -> replicators.size)
   }
 
-  private def persist(key: String, valueOption: Option[String], id: Long, persistenceClient: Option[ActorRef]): Unit = {
+  private def persist(key: String, valueOption: Option[String], id: Long): Unit = {
     persistence ! Persist(key, valueOption, id)
     persistenceAcks += (id -> sender)
     context.system.scheduler.scheduleOnce(100 milliseconds) {
       self ! RetryPersist(key, valueOption, id)
     }
-    persistenceClient.foreach(client => {
-      context.system.scheduler.scheduleOnce(1 seconds) {
-        self ! CheckPersist(id, client)
-      }
-    })
   }
 
   private def retryPersist(key: String, valueOption: Option[String], id: Long): Unit = {
     persistence ! Persist(key, valueOption, id)
     context.system.scheduler.scheduleOnce(100 milliseconds) {
       self ! RetryPersist(key, valueOption, id)
+    }
+  }
+
+  private def acksGlogalTimeout(id: Long, client: ActorRef): Unit = {
+    context.system.scheduler.scheduleOnce(1 seconds) {
+      self ! CheckPersist(id, client)
     }
   }
 
