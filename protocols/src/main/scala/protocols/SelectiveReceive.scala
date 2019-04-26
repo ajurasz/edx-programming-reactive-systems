@@ -1,6 +1,6 @@
 package protocols
 
-import akka.actor.typed._
+import akka.actor.typed.{ActorContext, _}
 import akka.actor.typed.scaladsl._
 
 object SelectiveReceive {
@@ -16,5 +16,26 @@ object SelectiveReceive {
       * Hint: Implement an [[ExtensibleBehavior]], use a [[StashBuffer]] and [[Behavior]] helpers such as `start`,
       * `validateAsInitial`, `interpretMessage`,`canonicalize` and `isUnhandled`.
       */
-    def apply[T](bufferSize: Int, initialBehavior: Behavior[T]): Behavior[T] = ???
+    def apply[T](bufferSize: Int, initialBehavior: Behavior[T]): Behavior[T] = {
+        val buffer = StashBuffer[T](bufferSize)
+        new Stasher[T](initialBehavior, buffer, bufferSize)
+    }
+
+    private class Stasher[T](behavior: Behavior[T], buffer: StashBuffer[T], bufferSize: Int) extends ExtensibleBehavior[T] {
+        override def receive(ctx: ActorContext[T], msg: T): Behavior[T] = {
+            val started = Behavior.validateAsInitial(Behavior.start(behavior, ctx))
+            val next = Behavior.interpretMessage(started, ctx, msg)
+            val canonical = Behavior.canonicalize(next, behavior, ctx)
+            if (Behavior.isUnhandled(next)) {
+                buffer.stash(msg)
+                new Stasher[T](canonical, buffer, bufferSize)
+            } else if (buffer.nonEmpty) {
+                buffer.unstashAll(ctx.asScala, new Stasher[T](canonical, StashBuffer[T](bufferSize), bufferSize))
+            } else {
+                new Stasher[T](canonical, buffer, bufferSize)
+            }
+        }
+
+        override def receiveSignal(ctx: ActorContext[T], msg: Signal): Behavior[T] = ???
+    }
 }
