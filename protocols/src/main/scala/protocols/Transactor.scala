@@ -74,7 +74,13 @@ object Transactor {
       * @param sessionRef Reference to the child [[Session]] actor
       */
     private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] =
-                ???
+        Behaviors.receivePartial {
+            case (_, Committed(session, value)) if sessionRef == session =>
+                idle(value, sessionTimeout)
+            case (ctx, RolledBack(session)) if sessionRef == session =>
+                ctx.stop(sessionRef)
+                idle(rollbackValue, sessionTimeout)
+        }
         
     /**
       * @return A behavior handling [[Session]] messages. See in the instructions
