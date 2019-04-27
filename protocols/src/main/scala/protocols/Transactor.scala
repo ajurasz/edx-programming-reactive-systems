@@ -96,15 +96,15 @@ object Transactor {
                 commit ! Committed(ctx.self, currentValue)
                 replyTo ! reply
                 Behaviors.stopped
-            case (ctx, Rollback()) =>
+            case (_, Rollback()) =>
                 Behaviors.stopped
-            case (ctx, Extract(f, replyTo)) =>
+            case (_, Extract(f, replyTo)) =>
                 replyTo ! f(currentValue)
                 Behaviors.same
-            case (ctx, Modify(f, id, reply, replyTo)) if done.contains(id) =>
+            case (_, Modify(_, id, reply, replyTo)) if done.contains(id) =>
                 replyTo ! reply
                 Behaviors.same
-            case (ctx, Modify(f, id, reply, replyTo)) =>
+            case (_, Modify(f, id, reply, replyTo)) =>
                 replyTo ! reply
                 val modifiedValue = f(currentValue)
                 sessionHandler(modifiedValue, commit, done + id)
