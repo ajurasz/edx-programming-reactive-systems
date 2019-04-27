@@ -31,7 +31,7 @@ object Transactor {
       *                       terminating the session
       */
     def apply[T](value: T, sessionTimeout: FiniteDuration): Behavior[Command[T]] =
-        ???
+        SelectiveReceive(30, idle(value, sessionTimeout).narrow)
 
     /**
       * @return A behavior that defines how to react to any [[PrivateCommand]] when the transactor
@@ -51,7 +51,17 @@ object Transactor {
       *   - Messages other than [[Begin]] should not change the behavior.
       */
     private def idle[T](value: T, sessionTimeout: FiniteDuration): Behavior[PrivateCommand[T]] =
-                ???
+        Behaviors.receivePartial {
+            case (ctx, Begin(replyTo)) =>
+                val session = ctx.spawnAnonymous(sessionHandler(value, ctx.self, Set.empty))
+                val next = inSession(value, sessionTimeout, session)
+                ctx.watchWith(session, RolledBack(session))
+                ctx.setReceiveTimeout(sessionTimeout, RolledBack(session))
+                replyTo ! session
+                next
+            case (_, Committed(_, _)) => Behavior.ignore
+            case (_, RolledBack(_)) => Behavior.ignore
+        }
         
     /**
       * @return A behavior that defines how to react to [[PrivateCommand]] messages when the transactor has
