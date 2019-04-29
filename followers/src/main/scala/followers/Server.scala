@@ -5,9 +5,10 @@ import akka.event.Logging
 import akka.stream.scaladsl.{BroadcastHub, Flow, Framing, Keep, MergeHub, Sink, Source}
 import akka.stream.{ActorAttributes, Materializer}
 import akka.util.ByteString
+import followers.model.Event.{Follow, Unfollow}
 import followers.model.{Event, Followers, Identity}
 
-import scala.collection.SortedSet
+import scala.collection.{SortedSet, mutable}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
 /**
@@ -31,7 +32,7 @@ object Server {
     * Hint: you may find the [[Framing]] flows useful.
     */
   val reframedFlow: Flow[ByteString, String, NotUsed] =
-    unimplementedFlow
+    Framing.delimiter(ByteString("\n"), 256).map(_.utf8String)
 
   /**
     * A flow that consumes chunks of bytes and produces [[Event]] messages.
@@ -44,7 +45,7 @@ object Server {
     * Hint: reuse `reframedFlow`
     */
   val eventParserFlow: Flow[ByteString, Event, NotUsed] =
-    unimplementedFlow
+    reframedFlow.map(Event.parse)
 
   /**
     * Implement a Sink that will look for the first [[Identity]]
@@ -57,7 +58,7 @@ object Server {
     * (and have a look at `Keep.right`).
     */
   val identityParserSink: Sink[ByteString, Future[Identity]] =
-    unimplementedSink
+    reframedFlow.map(Identity.parse).toMat(Sink.head)(Keep.right)
 
   /**
     * A flow that consumes unordered messages and produces messages ordered by `sequenceNr`.
@@ -72,7 +73,21 @@ object Server {
     * operation around in the operator.
     */
   val reintroduceOrdering: Flow[Event, Event, NotUsed] =
-    unimplementedFlow
+    Flow[Event].statefulMapConcat { () =>
+      var nextSeqId = 1
+      var buffer = List.empty[Event]
+
+      {
+        case event if nextSeqId == event.sequenceNr =>
+          val results = (event :: buffer).sortBy(_.sequenceNr)
+          nextSeqId = results.last.sequenceNr + 1
+          buffer = List.empty[Event]
+          results
+        case event =>
+          buffer = event :: buffer
+          Nil
+      }
+    }
 
   /**
     * A flow that associates a state of [[Followers]] to
@@ -83,7 +98,19 @@ object Server {
     *  - you may find the `statefulMapConcat` operation useful.
     */
   val followersFlow: Flow[Event, (Event, Followers), NotUsed] =
-    unimplementedFlow
+    Flow[Event].statefulMapConcat { () =>
+      var followers = Map.empty[Int, Set[Int]]
+
+      {
+        case follow: Follow =>
+          followers += (follow.fromUserId -> (followers.getOrElse(follow.fromUserId, Set.empty[Int]) + follow.toUserId))
+          List((follow, followers))
+        case unfollow: Unfollow =>
+          val following = followers.getOrElse(unfollow.fromUserId, Set.empty[Int])
+          followers += (unfollow.fromUserId -> (following - unfollow.toUserId))
+          List((unfollow, followers))
+      }
+    }
 
   /**
     * @return Whether the given user should be notified by the incoming `Event`,
