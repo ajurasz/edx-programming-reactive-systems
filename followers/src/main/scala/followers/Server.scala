@@ -119,8 +119,17 @@ object Server {
     * @param userId Id of the user
     * @param eventAndFollowers Event and current state of followers
     */
-  def isNotified(userId: Int)(eventAndFollowers: (Event, Followers)): Boolean =
-    ???
+  def isNotified(userId: Int)(eventAndFollowers: (Event, Followers)): Boolean = {
+    val (event, followers) = eventAndFollowers
+    event match {
+      case _: Event.Broadcast =>
+        true
+      case Event.StatusUpdate(_, fromUserId) =>
+        followers(userId).contains(fromUserId)
+    }
+  }
+
+
 
   // Utilities to temporarily have unimplemented parts of the program
   private def unimplementedFlow[A, B, C]: Flow[A, B, C] =
